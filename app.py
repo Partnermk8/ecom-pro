@@ -126,7 +126,7 @@ def process_report(df):
 
 # --- Интерфейс ---
 init_db()
-st.title("💎 Анализ отчетов Wildberries и OZON Pro (v2.5 - Ozon & WB Релиз)")
+st.title("💎 Ecom Insight Pro (v2.5 - Ozon & WB Релиз)")
 files = st.file_uploader("Загрузите отчеты (Excel, CSV, ZIP)", accept_multiple_files=True)
 
 if files:
