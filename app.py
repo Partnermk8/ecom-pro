@@ -8,7 +8,7 @@ import plotly.express as px
 st.set_page_config(page_title="Ecom Insight Pro", layout="wide")
 
 
-# --- База данных ---
+# --- БД ---
 def init_db():
     conn = sqlite3.connect("ecom_data.db")
     conn.execute('CREATE TABLE IF NOT EXISTS units (sku TEXT PRIMARY KEY, cost REAL)')
@@ -31,86 +31,80 @@ def save_cost(sku, cost):
 
 def to_num(s):
     if pd.isna(s) or s == '': return 0.0
-    s_clean = str(s).replace(',', '.').replace('\xa0', '').replace(' ', '').strip()
+    # Очистка от мусора: пробелы, валюта, переносы строк
+    s_clean = str(s).replace('\n', ' ').replace('\xa0', '').replace(' ', '').replace(',', '.').strip()
     try:
-        return float(pd.to_numeric(s_clean))
+        return float(pd.to_numeric(s_clean, errors='coerce'))
     except:
         return 0.0
 
 
-# --- Бронебойное чтение файлов ---
+# --- ЧТЕНИЕ ---
 def smart_read_file(content, filename):
-    if filename.lower().endswith('.pdf'): return None
     try:
         if filename.lower().endswith('.csv'):
-            # Пробуем разные кодировки и разделители для русского CSV
-            try:
-                df = pd.read_csv(io.BytesIO(content), sep=';', encoding='utf-8')
-                if len(df.columns) < 3: raise ValueError
-            except:
-                try:
-                    df = pd.read_csv(io.BytesIO(content), sep=',', encoding='utf-8')
-                except:
-                    df = pd.read_csv(io.BytesIO(content), sep=';', encoding='cp1251')
+            # Пробуем разные кодировки и разделители
+            for enc in ['utf-8', 'cp1251']:
+                for sep in [',', ';']:
+                    try:
+                        df = pd.read_csv(io.BytesIO(content), sep=sep, encoding=enc)
+                        if len(df.columns) > 5: break
+                    except:
+                        continue
+                else:
+                    continue
+                break
         else:
             df = pd.read_excel(io.BytesIO(content))
 
-        # Ищем строку с заголовками глубже (до 150 строк, из-за шапок Ozon)
-        markers = ["артикул поставщика", "артикул", "баркод", "sku", "номер отправления", "seller_sku"]
+        # Ищем заголовки (теперь до 200 строк вниз)
+        markers = ["артикул", "баркод", "sku", "номер отправления", "тип компенсации"]
         target_row = -1
-
-        for i in range(min(len(df), 150)):
-            row_vals = [str(val).lower().strip() for val in df.iloc[i].values]
-            # Проверяем точное совпадение или вхождение
-            if any(m in row_vals for m in markers) or any(any(m in str(v) for m in markers) for v in row_vals):
+        for i in range(min(len(df), 200)):
+            row_vals = [str(val).lower() for val in df.iloc[i].values]
+            if any(any(m in v for m in markers) for v in row_vals):
                 target_row = i
                 break
 
         if target_row != -1:
-            cols = [str(c).strip().lower() for c in df.iloc[target_row].values]
+            cols = [str(c).strip().replace('\n', ' ').lower() for c in df.iloc[target_row].values]
             df = df.iloc[target_row + 1:].reset_index(drop=True)
             df.columns = cols
             return df
         return None
-    except Exception as e:
-        st.error(f"Ошибка в файле {filename}: {e}")
+    except:
         return None
 
 
-# --- Обработка данных WB и Ozon ---
 def process_report(df):
     if df is None or df.empty: return None
     costs = get_costs()
     cols = list(df.columns)
 
-    # Определяем платформу по ключевым столбцам
-    is_wb = any(c in cols for c in ["обоснование для оплаты", "артикул поставщика", "вайлдберриз"])
-    is_ozon = any(c in cols for c in ["номер отправления", "начислено", "компенсаци", "seller_sku"]) and not is_wb
+    # Детекция WB (по специфичным заголовкам)
+    is_wb = any("обоснование" in c or "артикул поставщика" in c for c in cols)
+    # Детекция Ozon (по компенсациям или отправлениям)
+    is_ozon = any("номер отправления" in c or "компенсаци" in c or "начислен" in c for c in cols) and not is_wb
 
     try:
         if is_wb:
-            sku_cand = ["артикул поставщика", "артикул", "баркод", "barcode"]
-            sku_col = next((c for c in cols if any(m == c for m in sku_cand)), None)
-            rev_cand = ["к перечислению", "возмещение", "итого к оплате"]
-            rev_col = next((c for c in cols if any(m in c for m in rev_cand)), None)
+            sku_col = next((c for c in cols if any(m == c for m in ["артикул поставщика", "артикул", "баркод"])), None)
+            rev_col = next((c for c in cols if "к перечислению" in c or "возмещение" in c), None)
             log_col = next((c for c in cols if "логистика" in c or "доставке" in c), None)
             pen_col = next((c for c in cols if "штраф" in c), None)
             source = "Wildberries"
         elif is_ozon:
-            sku_cand = ["артикул", "sku", "seller_sku"]
-            sku_col = next((c for c in cols if any(m == c for m in sku_cand)), None)
-            # Добавлено слово "компенсаци" для Отчета о компенсациях
-            rev_col = next((c for c in cols if any(m in c for m in ["начислено", "итого", "сумма компенсаци"])), None)
-            source, log_col, pen_col = "Ozon", None, None
+            sku_col = next((c for c in cols if any(m == c for m in ["артикул", "sku", "seller_sku"])), None)
+            # Ищем "итого к начислению" или "сумма компенсации"
+            rev_col = next((c for c in cols if any(m in c for m in ["начислен", "сумма", "итого"])), None)
+            log_col, pen_col = None, None
+            source = "Ozon"
         else:
             return None
 
         if not sku_col or not rev_col: return None
 
-        # Убираем системные строки (пустые артикулы и слово "Итого")
         df = df[df[sku_col].astype(str).str.lower() != 'nan'].copy()
-        df = df[df[sku_col].astype(str).str.lower() != 'итого'].copy()
-
         res = pd.DataFrame({
             'Артикул': df[sku_col].astype(str).str.strip(),
             'Выручка': df[rev_col].apply(to_num),
@@ -124,40 +118,31 @@ def process_report(df):
         return None
 
 
-# --- Интерфейс ---
+# --- ИНТЕРФЕЙС ---
 init_db()
-st.title("💎 Ecom Insight Pro (v2.5 - Ozon & WB Релиз)")
-files = st.file_uploader("Загрузите отчеты (Excel, CSV, ZIP)", accept_multiple_files=True)
+st.title("💎 Ecom Insight Pro (v2.6)")
+files = st.file_uploader("Загрузите CSV или Excel отчеты", accept_multiple_files=True)
 
 if files:
     all_data = []
     for f in files:
-        if f.name.lower().endswith('.zip'):
-            with zipfile.ZipFile(f) as z:
-                for name in z.namelist():
-                    if name.lower().endswith(('.xlsx', '.csv', '.xls')):
-                        with z.open(name) as iz:
-                            d = smart_read_file(iz.read(), name)
-                            p = process_report(d)
-                            if p is not None: all_data.append(p)
-        else:
-            d = smart_read_file(f.read(), f.name)
-            p = process_report(d)
-            if p is not None: all_data.append(p)
+        d = smart_read_file(f.read(), f.name)
+        p = process_report(d)
+        if p is not None: all_data.append(p)
 
     if all_data:
-        df = pd.concat(all_data).groupby(['Артикул', 'Маркетплейс']).sum().reset_index()
+        df = pd.concat(all_data).groupby(['Артикул', 'Маркетплейс']).sum(numeric_only=True).reset_index()
         missing = df[df['Себестоимость'] == 0]['Артикул'].unique()
 
         if len(missing) > 0:
-            st.warning(f"🔎 Найдено новых товаров: {len(missing)}")
-            with st.form("costs"):
+            st.warning(f"🔎 Новых товаров: {len(missing)}")
+            with st.form("costs_form"):
                 for sku in missing:
                     c1, c2 = st.columns([3, 1])
                     c1.write(f"Артикул: **{sku}**")
-                    new_val = c2.number_input("Цена закупки", key=sku, min_value=0.0)
+                    new_val = c2.number_input("Цена закупа", key=sku, min_value=0.0)
                     if new_val > 0: df.loc[df['Артикул'] == sku, 'Себестоимость'] = new_val
-                if st.form_submit_button("🚀 Применить"):
+                if st.form_submit_button("🚀 Рассчитать"):
                     for sku in missing:
                         val = df.loc[df['Артикул'] == sku, 'Себестоимость'].values[0]
                         if val > 0: save_cost(sku, val)
@@ -167,11 +152,10 @@ if files:
         df['Прибыль'] = df['Выручка'] - df['Логистика'] - df['Штрафы'] - df['Себестоимость'] - df['Налог']
 
         st.divider()
-        col1, col2, col3 = st.columns(3)
-        col1.metric("💰 Выручка", f"{df['Выручка'].sum():,.0f} ₽")
-        col2.metric("📈 Прибыль", f"{df['Прибыль'].sum():,.0f} ₽")
-        col3.metric("📦 Позиций", len(df))
-
+        m1, m2, m3 = st.columns(3)
+        m1.metric("💰 Выручка", f"{df['Выручка'].sum():,.0f} ₽")
+        m2.metric("📈 Прибыль", f"{df['Прибыль'].sum():,.0f} ₽")
+        m3.metric("📦 Товаров", len(df))
         st.dataframe(df[['Артикул', 'Маркетплейс', 'Выручка', 'Прибыль']], use_container_width=True)
     else:
-        st.info("Программа не нашла данные. Проверьте, что загружены правильные отчеты.")
+        st.error("Данные не найдены. Убедитесь, что вы загрузили файлы CSV, а не PDF.")
