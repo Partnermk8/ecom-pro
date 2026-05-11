@@ -5,37 +5,8 @@ import zipfile
 import io
 import plotly.express as px
 
-# --- КОНФИГУРАЦИЯ СТРАНИЦЫ ---
-st.set_page_config(
-    page_title="Ecom Insight Pro",
-    page_icon="💎",
-    layout="centered",
-    initial_sidebar_state="collapsed"
-)
-
-# --- МОБИЛЬНЫЙ ИНТЕРФЕЙС (CSS) ---
-st.markdown("""
-    <style>
-    [data-testid="stMetricValue"] { font-size: 1.6rem !important; color: #00d4ff; }
-    .stButton>button { 
-        width: 100%; 
-        border-radius: 12px; 
-        height: 3.5em; 
-        background-color: #00d4ff; 
-        color: black; 
-        font-weight: bold; 
-        margin-top: 10px; 
-    }
-    div[data-testid="metric-container"] { 
-        background-color: #1a1c24; 
-        border: 1px solid #2d2f39; 
-        border-radius: 15px; 
-        padding: 15px; 
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3); 
-    }
-    .stDataFrame { border-radius: 15px; overflow: hidden; }
-    </style>
-    """, unsafe_allow_html=True)
+# --- НАСТРОЙКИ ---
+st.set_page_config(page_title="Ecom Insight Pro", layout="centered")
 
 # --- БАЗА ДАННЫХ ---
 DB_NAME = "ecom_data.db"
@@ -51,17 +22,28 @@ def get_costs():
     conn = sqlite3.connect(DB_NAME)
     df = pd.read_sql('SELECT * FROM units', conn)
     conn.close()
-    return dict(zip(df['sku'].astype(str), df['cost']))
+    return dict(zip(df['sku'].astype(str).str.strip(), df['cost']))
 
 
 def save_cost(sku, cost):
     conn = sqlite3.connect(DB_NAME)
-    conn.execute('INSERT OR REPLACE INTO units (sku, cost) VALUES (?, ?)', (str(sku), cost))
+    conn.execute('INSERT OR REPLACE INTO units (sku, cost) VALUES (?, ?)', (str(sku).strip(), cost))
     conn.commit()
     conn.close()
 
 
-# --- ЛОГИКА ОБРАБОТКИ ОТЧЕТОВ ---
+# --- ФУНКЦИЯ ОЧИСТКИ ЧИСЕЛ ---
+def to_num(s):
+    if pd.isna(s) or s == '': return 0.0
+    # Удаляем пробелы, заменяем запятые на точки, убираем лишние символы
+    s_clean = str(s).replace(',', '.').replace('\xa0', '').replace(' ', '').strip()
+    try:
+        return float(pd.to_numeric(s_clean))
+    except:
+        return 0.0
+
+
+# --- УЛУЧШЕННЫЙ ЗАГРУЗЧИК ФАЙЛОВ ---
 def smart_read_file(content, filename):
     try:
         if filename.lower().endswith('.csv'):
@@ -72,119 +54,126 @@ def smart_read_file(content, filename):
         else:
             df = pd.read_excel(io.BytesIO(content))
 
-        markers = ["артикул", "обоснование", "баркод", "sku", "номер отправления"]
-        for i in range(min(len(df), 40)):
-            row_str = " ".join([str(val).lower() for val in df.iloc[i].values])
-            if any(m in row_str for m in markers):
-                new_df = df.iloc[i + 1:].reset_index(drop=True)
-                new_df.columns = df.iloc[i].values
-                return new_df
+        # Ищем строку с заголовками (проверяем первые 50 строк)
+        target_row = -1
+        markers = ["артикул", "баркод", "sku", "номер отправления", "seller_sku"]
+
+        for i in range(min(len(df), 50)):
+            row_values = [str(val).lower() for val in df.iloc[i].values]
+            if any(m in " ".join(row_values) for m in markers):
+                target_row = i
+                break
+
+        if target_row != -1:
+            new_columns = df.iloc[target_row].values
+            df = df.iloc[target_row + 1:].reset_index(drop=True)
+            df.columns = [str(c).strip().lower() for c in new_columns]
+
         return df
     except:
         return None
 
 
-def process_report(df, filename):
+# --- УЛУЧШЕННАЯ ОБРАБОТКА ОТЧЕТА (WB + OZON) ---
+def process_report(df):
     if df is None or df.empty: return None
-    df.columns = [str(c).strip().lower() for c in df.columns]
+
     costs = get_costs()
+    cols = df.columns
 
     try:
-        is_wb = any("обоснование" in c for c in df.columns)
-        is_ozon = any("номер отправления" in c for c in df.columns)
+        # Определяем маркетплейс
+        is_wb = any(c in cols for c in ["обоснование для оплаты", "артикул поставщика"])
+        is_ozon = any(c in cols for c in ["номер отправления", "начислено", "артикул"]) and not is_wb
 
         if is_wb:
-            sku_col = [c for c in df.columns if any(m in c for m in ["артикул поставщика", "артикул"])][0]
-            rev_col = [c for c in df.columns if "к перечислению" in c][0]
-            log_col = [c for c in df.columns if any(m in c for m in ["логистика", "доставке"])][0]
-            pen_col = [c for c in df.columns if "штраф" in c]
+            sku_candidates = ["артикул поставщика", "артикул", "sa", "barcode"]
+            sku_col = next((c for c in cols if any(m == c for m in sku_candidates)), None)
+            rev_col = next((c for c in cols if "к перечислению" in c or "возмещение" in c), None)
+            log_col = next((c for c in cols if "логистика" in c or "услуги по доставке" in c), None)
+            pen_col = next((c for c in cols if "штраф" in c), None)
             source = "Wildberries"
         elif is_ozon:
-            sku_col = [c for c in df.columns if any(m in c for m in ["артикул", "sku"])][0]
-            rev_col = [c for c in df.columns if any(m in c for m in ["приход", "итого", "начислено"])][0]
-            log_col = None
-            pen_col = []
+            # Расширенный поиск для Ozon
+            sku_candidates = ["артикул", "артикул товара", "sku", "seller_sku", "offer_id"]
+            sku_col = next((c for c in cols if any(m == c for m in sku_candidates)), None)
+            rev_col = next((c for c in cols if "начислено" in c or "итого" in c or "сумма" in c), None)
+            log_col = None  # В отчетах Ozon логистика часто идет отдельными строками или уже вычтена
+            pen_col = None
             source = "Ozon"
         else:
             return None
 
-        to_num = lambda s: pd.to_numeric(s, errors='coerce').fillna(0)
+        if not sku_col or not rev_col: return None
+
+        # Фильтруем данные: убираем пустые артикулы и технические строки
+        df = df[df[sku_col].astype(str).str.lower() != 'nan'].copy()
+        df = df[df[sku_col].astype(str).str.strip() != ''].copy()
 
         res = pd.DataFrame({
-            'Артикул': df[sku_col].astype(str),
-            'Выручка': to_num(df[rev_col]),
-            'Логистика': to_num(df[log_col]) if log_col else 0,
-            'Штрафы': to_num(df[pen_col[0]]) if pen_col else 0,
+            'Артикул': df[sku_col].astype(str).str.strip(),
+            'Выручка': df[rev_col].apply(to_num),
+            'Логистика': df[log_col].apply(to_num) if log_col else 0.0,
+            'Штрафы': df[pen_col].apply(to_num) if pen_col else 0.0,
             'Маркетплейс': source
         })
-        res = res[res['Артикул'] != 'nan'].copy()
-        res['Себестоимость'] = res['Артикул'].map(costs).fillna(0)
+
+        # Итоговая фильтрация мусора
+        res = res[res['Артикул'].str.lower() != 'итого']
+        res['Себестоимость'] = res['Артикул'].map(costs).fillna(0.0)
+
         return res
-    except Exception:
+    except Exception as e:
         return None
 
 
-# --- ГЛАВНЫЙ ЭКРАН ---
+# --- ИНТЕРФЕЙС ---
 init_db()
+st.title("💎 Ecom Insight Pro (v2.1)")
 
-st.title("💎 Ecom Insight Pro")
+files = st.file_uploader("Загрузите отчеты (WB или Ozon)", accept_multiple_files=True)
 
-uploaded_files = st.file_uploader("📁 Загрузите отчеты (ZIP, XLSX, CSV)", accept_multiple_files=True)
-
-if uploaded_files:
-    raw_data = []
-    for f in uploaded_files:
+if files:
+    all_data = []
+    for f in files:
         if f.name.lower().endswith('.zip'):
             with zipfile.ZipFile(f) as z:
-                for zinfo in z.infolist():
-                    try:
-                        fname = zinfo.filename.encode('cp437').decode('cp866')
-                    except:
-                        fname = zinfo.filename
-                    if fname.lower().endswith(('.xlsx', '.csv')):
-                        with z.open(zinfo) as internal_f:
-                            df_f = smart_read_file(internal_f.read(), fname)
-                            res_f = process_report(df_f, fname)
-                            if res_f is not None: raw_data.append(res_f)
+                for name in z.namelist():
+                    if name.lower().endswith(('.xlsx', '.csv')):
+                        with z.open(name) as iz:
+                            d = smart_read_file(iz.read(), name)
+                            processed = process_report(d)
+                            if processed is not None: all_data.append(processed)
         else:
-            df_f = smart_read_file(f.read(), f.name)
-            res_f = process_report(df_f, f.name)
-            if res_f is not None: raw_data.append(res_f)
+            d = smart_read_file(f.read(), f.name)
+            processed = process_report(d)
+            if processed is not None: all_data.append(processed)
 
-    if raw_data:
-        df = pd.concat(raw_data).reset_index(drop=True)
+    if all_data:
+        full_df = pd.concat(all_data).groupby(['Артикул', 'Маркетплейс']).sum().reset_index()
 
-        # Настройка недостающей себестоимости
-        missing = df[df['Себестоимость'] == 0]['Артикул'].unique()
+        # Настройка недостающих цен
+        missing = full_df[full_df['Себестоимость'] == 0]['Артикул'].unique()
         if len(missing) > 0:
-            with st.expander("💸 Укажите себестоимость", expanded=True):
-                with st.form("prices"):
-                    for sku in missing:
-                        new_val = st.number_input(f"Товар: {sku}", min_value=0.0, key=sku)
-                        if new_val > 0: save_cost(sku, new_val)
-                    if st.form_submit_button("🔥 Сохранить и рассчитать"):
+            with st.expander("📝 Укажите себестоимость для новых товаров", expanded=True):
+                for sku in missing:
+                    c1, c2 = st.columns([3, 1])
+                    c1.write(f"Артикул: `{sku}`")
+                    new_p = c2.number_input("Цена", key=f"in_{sku}", min_value=0.0)
+                    if new_p > 0:
+                        save_cost(sku, new_p)
                         st.rerun()
 
-        # Расчет показателей
-        df['Налоги (6%)'] = df['Выручка'] * 0.06
-        df['Прибыль'] = df['Выручка'] - df['Логистика'] - df['Штрафы'] - df['Себестоимость'] - df['Налоги (6%)']
+        # Расчеты прибыли
+        full_df['Налог'] = full_df['Выручка'] * 0.06
+        full_df['Прибыль'] = full_df['Выручка'] - full_df['Логистика'] - full_df['Штрафы'] - full_df['Себестоимость'] - \
+                             full_df['Налог']
 
-        st.subheader("📊 Ключевые метрики")
-        m1, m2 = st.columns(2)
-        m1.metric("Выручка", f"{df['Выручка'].sum():,.0f} ₽")
-        m2.metric("Прибыль", f"{df['Прибыль'].sum():,.0f} ₽")
+        st.divider()
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Общая Выручка", f"{full_df['Выручка'].sum():,.0f} ₽")
+        m2.metric("Себестоимость", f"{full_df['Себестоимость'].sum():,.0f} ₽")
+        m3.metric("Чистая Прибыль", f"{full_df['Прибыль'].sum():,.2f} ₽")
 
-        st.subheader("📍 Доли маркетплейсов")
-        fig_pie = px.pie(df, values='Выручка', names='Маркетплейс', hole=0.5,
-                         color_discrete_sequence=['#00d4ff', '#ff007a'])
-        st.plotly_chart(fig_pie, use_container_width=True)
-
-        st.subheader("🏆 ТОП-5 товаров по прибыли")
-        top_df = df.groupby('Артикул')['Прибыль'].sum().nlargest(5).reset_index()
-        fig_bar = px.bar(top_df, x='Прибыль', y='Артикул', orientation='h', color='Прибыль')
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-        st.subheader("📋 Полная таблица")
-        st.dataframe(df, use_container_width=True)
-else:
-    st.info("👋 Ожидаю загрузки отчетов...")
+        st.subheader("📋 Таблица по товарам")
+        st.dataframe(full_df[['Артикул', 'Маркетплейс', 'Выручка', 'Прибыль']], use_container_width=True)
