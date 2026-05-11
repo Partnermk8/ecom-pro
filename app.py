@@ -47,42 +47,38 @@ def to_num(s):
 def is_valid_sku(value):
     """
     Проверяет, является ли значение валидным артикулом.
-    Артикул должен содержать буквы и цифры
+    Артикул должен содержать буквы и цифры/дефис
     """
     if pd.isna(value) or value == '' or value is None:
         return False
-    
+
     s = str(value).strip()
-    
+
     if not s:
         return False
-    
-    # Исключаем явно не артикулы
+
+    # Исключаем служебные строки
     if s.lower() in ['итого', 'всего', 'наименование', 'итог', 'total', 'nan']:
         return False
-    
-    # Артикул должен содержать буквы и цифры/дефис
+
+    # Содержит буквы (русские или английские)
     has_letters = bool(re.search(r'[а-яА-Яa-zA-Z]', s))
-    has_digits_or_dash = bool(re.search(r'[\d\-]', s))
-    
+
+    # Если нет букв - это не артикул
     if not has_letters:
         return False
-    
+
     # Слишком длинные строки - скорее всего не артикулы
-    if len(s) > 20:
+    if len(s) > 30:
         return False
-    
-    # Чисто числовые строки не подходят
-    if s.replace('-', '').isdigit() and not has_letters:
-        return False
-    
+
     return True
 
 
 def extract_archives(uploaded_files):
     """Извлекает файлы из архивов"""
     all_files = []
-    
+
     for uploaded_file in uploaded_files:
         if uploaded_file.name.lower().endswith('.zip'):
             try:
@@ -92,7 +88,7 @@ def extract_archives(uploaded_files):
                             continue
                         if file_name.endswith('/'):
                             continue
-                        
+
                         content = zip_ref.read(file_name)
                         ext = os.path.splitext(file_name)[1].lower()
                         if ext in ['.xlsx', '.xls', '.csv']:
@@ -107,11 +103,12 @@ def extract_archives(uploaded_files):
                 'name': uploaded_file.name,
                 'content': uploaded_file.read()
             })
-    
+
     return all_files
 
 
-# --- Обработка Ozon ---
+# ============ OZON (НЕ ТРОГАЕМ, РАБОТАЕТ) ============
+
 def find_header_row_ozon(df_raw):
     """Находит строку с заголовками Ozon (Артикул + SKU)"""
     for r in range(min(len(df_raw), 100)):
@@ -120,22 +117,20 @@ def find_header_row_ozon(df_raw):
                 break
             val = str(df_raw.iloc[r, c]).strip().lower()
             next_val = str(df_raw.iloc[r, c + 1]).strip().lower()
-            
+
             if val == "артикул" and next_val == "sku":
                 return r
-    
+
     return None
 
 
 def find_revenue_column_ozon(df_raw, header_row, sku_col):
     """Находит колонку с итоговой выручкой в отчете Ozon"""
-    # Ищем по заголовку
     for c in range(len(df_raw.columns)):
         header = str(df_raw.iloc[header_row, c]).strip().lower()
         if 'итого к начислению' in header:
             return c
-    
-    # Если не нашли, ищем по стандартной позиции
+
     if sku_col is not None:
         potential_col = sku_col + 10
         if potential_col < len(df_raw.columns):
@@ -146,7 +141,7 @@ def find_revenue_column_ozon(df_raw, header_row, sku_col):
                     sample_count += 1
             if sample_count >= 2:
                 return potential_col
-    
+
     return None
 
 
@@ -155,64 +150,62 @@ def process_ozon_report(df_raw):
     header_row = find_header_row_ozon(df_raw)
     if header_row is None:
         return None
-    
-    # Определяем колонки
+
     headers = {}
     for c in range(len(df_raw.columns)):
         header = str(df_raw.iloc[header_row, c]).strip().lower()
         if header and header != 'nan':
             headers[c] = header
-    
+
     sku_col = None
     for col_idx, header in headers.items():
         if header == 'артикул':
             sku_col = col_idx
             break
-    
+
     if sku_col is None:
         return None
-    
+
     revenue_col = find_revenue_column_ozon(df_raw, header_row, sku_col)
     if revenue_col is None:
         return None
-    
-    # Читаем данные со 2-й строки после заголовков
+
     data_start = header_row + 2
-    
+
     result_data = []
-    
+
     for r in range(data_start, len(df_raw)):
         if sku_col >= len(df_raw.columns):
             continue
-            
+
         sku_value = df_raw.iloc[r, sku_col]
-        
+
         if not is_valid_sku(sku_value):
             continue
-        
+
         sku = str(sku_value).strip().upper()
-        
+
         if revenue_col < len(df_raw.columns):
             revenue = to_num(df_raw.iloc[r, revenue_col])
         else:
             revenue = 0.0
-        
+
         result_data.append({
             'Артикул': sku,
             'Выручка': revenue,
             'Маркетплейс': 'Ozon'
         })
-    
+
     if not result_data:
         return None
-    
+
     return pd.DataFrame(result_data)
 
 
 def process_ozon_compensation(df_raw):
     """Обрабатывает отчет о компенсациях Ozon"""
     header_row = None
-    
+
     for r in range(min(len(df_raw), 100)):
         for c in range(len(df_raw.columns)):
             val = str(df_raw.iloc[r, c]).strip().lower()
@@ -221,24 +214,23 @@ def process_ozon_compensation(df_raw):
                 break
         if header_row is not None:
             break
-    
+
     if header_row is None:
         return None
-    
+
     sku_col = None
     revenue_col = None
-    
+
     for c in range(len(df_raw.columns)):
         header = str(df_raw.iloc[header_row, c]).strip().lower()
         if header == "артикул":
             sku_col = c
         elif "итого к начислению" in header:
             revenue_col = c
-    
+
     if sku_col is None:
         return None
-    
-    # Ищем колонку с числами в конце
+
     if revenue_col is None:
         for c in range(len(df_raw.columns) - 1, sku_col + 1, -1):
             if header_row + 1 < len(df_raw):
@@ -246,200 +238,230 @@ def process_ozon_compensation(df_raw):
                 if sample_val > 0:
                     revenue_col = c
                     break
-    
+
     if revenue_col is None:
         return None
-    
+
     result_data = []
-    
+
     for r in range(header_row + 1, len(df_raw)):
         if sku_col >= len(df_raw.columns):
             continue
-            
+
         sku_value = df_raw.iloc[r, sku_col]
-        
+
         if not is_valid_sku(sku_value):
             continue
-        
+
         sku = str(sku_value).strip().upper()
-        
+
         if revenue_col < len(df_raw.columns):
             revenue = to_num(df_raw.iloc[r, revenue_col])
         else:
             revenue = 0.0
-        
+
         result_data.append({
             'Артикул': sku,
             'Выручка': revenue,
             'Маркетплейс': 'Ozon'
         })
-    
+
     if not result_data:
         return None
-    
+
     return pd.DataFrame(result_data)
 
 
-# --- Обработка Wildberries ---
-def is_wb_report(df_raw):
-    """Определяет, является ли отчет от Wildberries"""
-    for r in range(min(len(df_raw), 10)):
-        row_values = [str(x).strip().lower() for x in df_raw.iloc[r] if pd.notna(x)]
-        row_text = ' '.join(row_values)
-        if 'артикул поставщика' in row_text and 'к перечислению продавцу' in row_text:
-            return True
-    return False
+# ============ WILDBERRIES (ИСПРАВЛЯЕМ) ============
+
+def debug_wb_raw(df_raw, sheet_name=""):
+    """Выводит отладочную информацию о структуре WB отчета"""
+    st.write(f"### 🔍 Отладка WB: {sheet_name}")
+    st.write(f"Размер таблицы: {df_raw.shape[0]} строк x {df_raw.shape[1]} колонок")
+
+    # Показываем первые 15 строк, первые 30 колонок
+    st.write("**Первые строки:**")
+    max_cols = min(30, df_raw.shape[1])
+    st.dataframe(df_raw.iloc[:15, :max_cols], use_container_width=True)
+
+    # Ищем ключевые слова
+    st.write("**Поиск ключевых колонок:**")
+    for r in range(min(15, len(df_raw))):
+        for c in range(min(30, len(df_raw.columns))):
+            val = str(df_raw.iloc[r, c]).strip().lower()
+            if any(kw in val for kw in ['артикул', 'перечислен', 'продаж', 'тип документ', 'обоснование']):
+                st.write(f"  Строка {r}, Колонка {c}: '{val}'")
 
 
-def process_wb_report(df_raw):
-    """Обрабатывает отчет Wildberries"""
-    # Ищем строку с заголовками
+def process_wb_report(df_raw, debug=False, sheet_name=""):
+    """Обрабатывает отчет Wildberries. Исправленная версия."""
+
+    # ===== Шаг 1: Ищем заголовки =====
     header_row = None
-    
-    for r in range(min(len(df_raw), 20)):
-        row_values = [str(x).strip().lower() for x in df_raw.iloc[r] if pd.notna(x)]
-        if 'артикул поставщика' in row_values and 'к перечислению продавцу' in row_values:
+
+    for r in range(min(len(df_raw), 30)):
+        # Собираем все значения строки
+        row_values = []
+        for c in range(min(len(df_raw.columns), 50)):
+            val = str(df_raw.iloc[r, c]).strip().lower()
+            if val and val != 'nan':
+                row_values.append(val)
+
+        # Проверяем наличие ключевых колонок
+        has_artikul = 'артикул поставщика' in row_values
+        has_perechislen = any('к перечислению продавцу' in v for v in row_values)
+
+        if has_artikul and has_perechislen:
             header_row = r
+            if debug:
+                st.write(f"✅ Найдена строка заголовков: {r}")
             break
-    
+
     if header_row is None:
+        # Пробуем найти по отдельности
+        for r in range(min(len(df_raw), 30)):
+            row_text = ' '.join([str(df_raw.iloc[r, c]).strip().lower()
+                                 for c in range(min(50, len(df_raw.columns)))])
+            if 'артикул поставщика' in row_text:
+                header_row = r
+                if debug:
+                    st.write(f"⚠️ Найдена строка с 'артикул поставщика': {r}")
+                break
+
+    if header_row is None:
+        if debug:
+            st.error("❌ Строка заголовков не найдена")
         return None
-    
-    # Определяем индексы колонок
+
+    # ===== Шаг 2: Определяем колонки =====
     sku_col = None
     revenue_col = None
     doc_type_col = None
-    
-    for c in range(len(df_raw.columns)):
+
+    for c in range(min(len(df_raw.columns), 100)):
         header = str(df_raw.iloc[header_row, c]).strip().lower()
-        
-        if header == 'артикул поставщика':
+
+        if 'артикул поставщика' == header or 'артикул' == header:
             sku_col = c
         elif 'к перечислению продавцу' in header:
             revenue_col = c
-        elif header == 'тип документа' or header == 'обоснование для оплаты':
+        elif header in ['тип документа', 'обоснование для оплаты']:
             doc_type_col = c
-    
+
+    if debug:
+        st.write(f"📋 Колонки: Артикул={sku_col}, Выручка={revenue_col}, Тип={doc_type_col}")
+
     if sku_col is None or revenue_col is None:
+        if debug:
+            st.error(f"❌ Не найдены колонки: Артикул={sku_col}, Выручка={revenue_col}")
         return None
-    
-    # Собираем данные
+
+    # ===== Шаг 3: Собираем данные =====
     result_data = []
-    skipped_empty = 0
-    max_empty_rows = 50  # Максимум пустых строк подряд
-    
+
     for r in range(header_row + 1, len(df_raw)):
-        # Проверяем тип документа (берем только "Продажа")
-        if doc_type_col is not None and doc_type_col < len(df_raw.columns):
-            doc_type = str(df_raw.iloc[r, doc_type_col]).strip().lower()
-            if doc_type != 'продажа':
-                continue
-        
+        # Проверяем тип документа (если есть колонка)
+        if doc_type_col is not None:
+            if doc_type_col < len(df_raw.columns):
+                doc_type = str(df_raw.iloc[r, doc_type_col]).strip().lower()
+                # Берем только строки с "Продажа"
+                if doc_type != 'продажа':
+                    continue
+
+        # Получаем артикул
         if sku_col >= len(df_raw.columns):
             continue
-            
+
         sku_value = df_raw.iloc[r, sku_col]
-        
-        # Проверяем валидность артикула
+
+        # Проверяем валидность
         if not is_valid_sku(sku_value):
-            skipped_empty += 1
-            # Если слишком много пустых строк подряд, заканчиваем
-            if skipped_empty > max_empty_rows:
-                break
             continue
-        
-        skipped_empty = 0  # Сбрасываем счетчик
-        
+
         sku = str(sku_value).strip().upper()
-        
+
+        # Получаем выручку
         if revenue_col < len(df_raw.columns):
             revenue = to_num(df_raw.iloc[r, revenue_col])
         else:
             revenue = 0.0
-        
-        if revenue > 0:  # Только с положительной выручкой
+
+        if revenue > 0:
             result_data.append({
                 'Артикул': sku,
                 'Выручка': revenue,
                 'Маркетплейс': 'WB'
             })
-    
+
+            if debug and len(result_data) <= 5:
+                st.write(f"  ✅ Строка {r}: Артикул='{sku}', Выручка={revenue}")
+
+    if debug:
+        st.write(f"📊 Найдено записей: {len(result_data)}")
+
     if not result_data:
         return None
-    
+
     return pd.DataFrame(result_data)
 
 
-# --- Основная функция обработки ---
-def process_single_file(file_info):
+# ============ Основная обработка ============
+
+def process_single_file(file_info, debug=False):
     """Обрабатывает один файл"""
     content = file_info['content']
     filename = file_info['name']
-    
+
     try:
         if filename.lower().endswith(('.xlsx', '.xls')):
             excel_file = pd.ExcelFile(io.BytesIO(content))
             all_results = []
-            
+
             for sheet_name in excel_file.sheet_names:
                 sheet_lower = sheet_name.lower()
-                
+
                 # Пропускаем служебные листы
-                skip_keywords = ['биллинг', 'взаиморасчет', 'перевыставлен', 
-                               'лояльност', 'штраф', 'механик', 'суммах услуг']
+                skip_keywords = ['биллинг', 'взаиморасчет', 'перевыставлен',
+                                 'лояльност', 'штраф', 'механик', 'суммах услуг']
                 if any(keyword in sheet_lower for keyword in skip_keywords):
                     continue
-                
+
                 try:
-                    df_raw = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, 
-                                          header=None, dtype=str)
+                    df_raw = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name,
+                                           header=None, dtype=str)
                 except:
                     continue
-                
+
                 if df_raw.empty or len(df_raw.columns) < 2:
                     continue
-                
+
                 # Определяем тип отчета
                 result = None
-                
-                if is_wb_report(df_raw):
-                    result = process_wb_report(df_raw)
-                    if result is not None and not result.empty:
-                        st.success(f"✅ {filename} / {sheet_name} → Wildberries")
-                else:
-                    # Пробуем Ozon форматы
+
+                # Сначала проверяем Ozon
+                if find_header_row_ozon(df_raw) is not None:
                     result = process_ozon_report(df_raw)
                     if result is None:
                         result = process_ozon_compensation(df_raw)
                     if result is not None and not result.empty:
                         st.success(f"✅ {filename} / {sheet_name} → Ozon")
-                
+                else:
+                    # Если не Ozon, пробуем WB
+                    if debug:
+                        debug_wb_raw(df_raw, sheet_name)
+                    result = process_wb_report(df_raw, debug=debug, sheet_name=sheet_name)
+                    if result is not None and not result.empty:
+                        st.success(f"✅ {filename} / {sheet_name} → Wildberries")
+
                 if result is not None and not result.empty:
                     all_results.append(result)
-            
+
             if all_results:
                 return pd.concat(all_results, ignore_index=True)
-        
-        elif filename.lower().endswith('.csv'):
-            try:
-                df_raw = pd.read_csv(io.BytesIO(content), header=None, dtype=str)
-            except:
-                return None
-            
-            if df_raw.empty:
-                return None
-            
-            if is_wb_report(df_raw):
-                return process_wb_report(df_raw)
-            else:
-                result = process_ozon_report(df_raw)
-                if result is None:
-                    result = process_ozon_compensation(df_raw)
-                return result
-    
+
     except Exception as e:
-        st.error(f"Ошибка обработки {filename}: {str(e)[:100]}")
-    
+        st.error(f"Ошибка обработки {filename}: {str(e)[:200]}")
+
     return None
 
 
@@ -451,16 +473,18 @@ st.markdown("""
 **Форматы:** Excel (.xlsx, .xls), CSV, ZIP архивы
 """)
 
+debug_mode = st.checkbox("🔍 Режим отладки (показать структуру WB отчетов)", value=True)
+
 with st.expander("📋 Правила обработки", expanded=False):
     st.markdown("""
     **Ozon:**
     - Поиск связки 'Артикул + SKU' в заголовках
     - Чтение данных со 2-й строки после заголовков
     - Выручка из колонки 'Итого к начислению'
-    
+
     **Wildberries:**
-    - Поиск заголовка 'Артикул поставщика'
-    - Только строки с типом документа 'Продажа'
+    - Поиск 'Артикул поставщика' и 'К перечислению Продавцу'
+    - Только строки с типом 'Продажа'
     - Выручка из колонки 'К перечислению Продавцу'
     """)
 
@@ -471,44 +495,42 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    # Извлекаем файлы
     with st.spinner('Распаковываю архивы...'):
         all_files = extract_archives(uploaded_files)
-    
+
     if not all_files:
         st.error("Не найдено поддерживаемых файлов")
         st.stop()
-    
+
     st.info(f"Найдено файлов для обработки: {len(all_files)}")
-    
-    # Обрабатываем файлы
+
     all_data = []
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
+
     for i, file_info in enumerate(all_files):
         status_text.text(f"Обрабатываю: {file_info['name']}")
-        result = process_single_file(file_info)
-        
+        result = process_single_file(file_info, debug=debug_mode)
+
         if result is not None and not result.empty:
             all_data.append(result)
-        
+
         progress_bar.progress((i + 1) / len(all_files))
-    
+
     status_text.text("Обработка завершена!")
-    
+
     if all_data:
         full_df = pd.concat(all_data, ignore_index=True)
-        
+
         # Группируем
         full_df = full_df.groupby(['Артикул', 'Маркетплейс']).agg({
             'Выручка': 'sum'
         }).reset_index()
-        
+
         # Добавляем себестоимость
         costs = get_costs()
         full_df['Себестоимость'] = full_df['Артикул'].map(costs).fillna(0.0)
-        
+
         # Проверка цен
         missing = full_df[full_df['Себестоимость'] == 0]['Артикул'].unique()
         if len(missing) > 0:
@@ -518,7 +540,7 @@ if uploaded_files:
                     new_costs = {}
                     cols_per_row = 4
                     missing_list = sorted(missing)
-                    
+
                     for i in range(0, len(missing_list), cols_per_row):
                         cols = st.columns(cols_per_row)
                         for j in range(cols_per_row):
@@ -535,35 +557,35 @@ if uploaded_files:
                                     )
                                     if new_v > 0:
                                         new_costs[sku] = new_v
-                    
+
                     if st.form_submit_button("💾 Сохранить и пересчитать"):
                         for sku, cost in new_costs.items():
                             save_cost(sku, cost)
                         st.rerun()
-        
+
         # Расчеты
         full_df['Налог'] = full_df['Выручка'] * 0.06
         full_df['Прибыль'] = full_df['Выручка'] - full_df['Себестоимость'] - full_df['Налог']
-        
+
         for col in ['Выручка', 'Себестоимость', 'Налог', 'Прибыль']:
             full_df[col] = full_df[col].round(2)
-        
+
         full_df = full_df.sort_values('Прибыль', ascending=False)
-        
-        # --- Сводка по маркетплейсам ---
+
+        # Сводка
         st.divider()
         st.subheader("📊 Сводка по маркетплейсам")
-        
+
         mp_summary = full_df.groupby('Маркетплейс').agg({
             'Выручка': 'sum',
             'Себестоимость': 'sum',
             'Налог': 'sum',
             'Прибыль': 'sum'
         }).round(2)
-        
+
         if len(mp_summary) > 0:
             cols_mp = st.columns(len(mp_summary))
-            
+
             for idx, (mp, row) in enumerate(mp_summary.iterrows()):
                 with cols_mp[idx]:
                     emoji = "🟦" if mp == 'Ozon' else "🟪"
@@ -572,32 +594,20 @@ if uploaded_files:
                     st.metric("Прибыль", f"{row['Прибыль']:,.0f} ₽")
                     roi = (row['Прибыль'] / row['Выручка'] * 100) if row['Выручка'] > 0 else 0
                     st.metric("ROI", f"{roi:.1f}%")
-        
-        # --- Общая таблица ---
+
+        # Общая таблица
         st.divider()
         st.subheader("📋 Общая таблица")
-        
+
         total_revenue = full_df['Выручка'].sum()
         total_profit = full_df['Прибыль'].sum()
-        total_cost = full_df['Себестоимость'].sum()
-        total_tax = full_df['Налог'].sum()
-        roi = (total_profit / total_revenue * 100) if total_revenue > 0 else 0
-        
-        m1, m2, m3, m4, m5 = st.columns(5)
+
+        m1, m2 = st.columns(2)
         m1.metric("💰 Общая выручка", f"{total_revenue:,.0f} ₽")
-        m2.metric("📦 Себестоимость", f"{total_cost:,.0f} ₽")
-        m3.metric("💸 Налог", f"{total_tax:,.0f} ₽")
-        m4.metric("📈 Прибыль", f"{total_profit:,.0f} ₽")
-        m5.metric("📊 ROI", f"{roi:.1f}%")
-        
-        # Форматирование таблицы
+        m2.metric("📈 Общая прибыль", f"{total_profit:,.0f} ₽")
+
         st.dataframe(
-            full_df.style.format({
-                'Выручка': '{:,.2f}',
-                'Себестоимость': '{:,.2f}',
-                'Налог': '{:,.2f}',
-                'Прибыль': '{:,.2f}'
-            }),
+            full_df,
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -607,64 +617,10 @@ if uploaded_files:
                 'Прибыль': st.column_config.NumberColumn(format='%.2f ₽'),
             }
         )
-        
-        # --- Раздельная аналитика ---
-        with st.expander("📊 Раздельная аналитика по маркетплейсам"):
-            tab1, tab2 = st.tabs(["🟦 Ozon", "🟪 Wildberries"])
-            
-            with tab1:
-                ozon_df = full_df[full_df['Маркетплейс'] == 'Ozon'].copy()
-                if not ozon_df.empty:
-                    st.dataframe(
-                        ozon_df.style.format({
-                            'Выручка': '{:,.2f}',
-                            'Себестоимость': '{:,.2f}',
-                            'Налог': '{:,.2f}',
-                            'Прибыль': '{:,.2f}'
-                        }),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                    csv_ozon = ozon_df.to_csv(index=False)
-                    st.download_button("📥 Ozon CSV", csv_ozon, "ozon_report.csv", "text/csv")
-                else:
-                    st.info("Нет данных Ozon")
-            
-            with tab2:
-                wb_df = full_df[full_df['Маркетплейс'] == 'WB'].copy()
-                if not wb_df.empty:
-                    st.dataframe(
-                        wb_df.style.format({
-                            'Выручка': '{:,.2f}',
-                            'Себестоимость': '{:,.2f}',
-                            'Налог': '{:,.2f}',
-                            'Прибыль': '{:,.2f}'
-                        }),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                    csv_wb = wb_df.to_csv(index=False)
-                    st.download_button("📥 WB CSV", csv_wb, "wb_report.csv", "text/csv")
-                else:
-                    st.info("Нет данных Wildberries")
-        
-        # --- Общий экспорт ---
+
+        # Экспорт
         csv_all = full_df.to_csv(index=False)
-        st.download_button("📥 Скачать общий отчет", csv_all, "ecom_insight_full_report.csv", "text/csv")
-        
+        st.download_button("📥 Скачать отчет", csv_all, "ecom_insight_report.csv", "text/csv")
+
     else:
         st.error("❌ Не удалось найти данные в загруженных файлах.")
-        st.info("""
-        **Проверьте, что файлы содержат:**
-        
-        **Для Ozon:**
-        - Связку 'Артикул + SKU' в заголовках
-        - Артикулы: буквы + цифры (КБ-25, РБ-3)
-        
-        **Для Wildberries:**
-        - Заголовок 'Артикул поставщика'
-        - Колонку 'К перечислению Продавцу'
-        - Тип документа 'Продажа'
-        
-        **Форматы:** Excel (.xlsx, .xls), CSV, ZIP
-        """)
