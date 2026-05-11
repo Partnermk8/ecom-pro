@@ -29,7 +29,7 @@ def save_cost(sku, cost):
 
 
 def to_num(s):
-    """Конвертирует значение в число, обрабатывая различные форматы"""
+    """Конвертирует значение в число"""
     if pd.isna(s) or s == '' or s is None:
         return 0.0
     if isinstance(s, (int, float)):
@@ -41,171 +41,195 @@ def to_num(s):
         return 0.0
 
 
-# --- Специализированное чтение под ваш запрос ---
-def ultra_smart_read(content, filename):
-    """Умное чтение файлов Ozon и Wildberries"""
-    try:
-        # Читаем файл без заголовков, чтобы видеть сырую сетку
-        if filename.lower().endswith('.csv'):
-            df_raw = pd.read_csv(io.BytesIO(content), header=None, dtype=str, encoding='utf-8')
-        else:
-            df_raw = pd.read_excel(io.BytesIO(content), header=None, dtype=str)
+def find_sku_and_revenue_columns(df_raw, header_row):
+    """
+    Находит колонки с артикулом и выручкой на основе заголовков
+    Возвращает индексы колонок
+    """
+    headers = {}
+    for c in range(len(df_raw.columns)):
+        header = str(df_raw.iloc[header_row, c]).strip().lower()
+        if header and header != 'nan':
+            headers[c] = header
 
-        # Ищем связку "Артикул + SKU" (Ozon)
-        found_row, found_col_sku = -1, -1
+    # Ищем колонку с артикулом (обычно вторая колонка, "Артикул")
+    sku_col = None
+    for col_idx, header in headers.items():
+        if header == 'артикул':
+            sku_col = col_idx
+            break
 
-        for r in range(min(len(df_raw), 100)):
-            for c in range(len(df_raw.columns) - 1):
-                val = str(df_raw.iloc[r, c]).strip().lower()
-                next_val = str(df_raw.iloc[r, c + 1]).strip().lower()
+    # Ищем колонку с итоговой выручкой
+    # В отчете Ozon это колонка "Итого к начислению, руб." (13-я колонка, индекс 12)
+    revenue_col = None
 
-                if val == "артикул" and next_val == "sku":
-                    found_row = r
-                    found_col_sku = c
-                    break
-            if found_row != -1:
+    # Сначала ищем точное совпадение
+    for col_idx, header in headers.items():
+        if 'итого к начислению' in header:
+            revenue_col = col_idx
+            break
+
+    # Если не нашли, ищем по номерам колонок из структуры отчета
+    if revenue_col is None and sku_col is not None:
+        # В стандартном отчете Ozon:
+        # Колонка 1 (индекс 0): № п/п
+        # Колонка 2 (индекс 1): Название товара
+        # Колонка 3 (индекс 2): Артикул
+        # Колонка 13 (индекс 12): Итого к начислению, руб.
+        potential_revenue_col = sku_col + 10  # 10 колонок после артикула
+        if potential_revenue_col < len(df_raw.columns):
+            # Проверяем, что в этой колонке есть числовые данные
+            sample_values = []
+            for r in range(header_row + 2, min(header_row + 5, len(df_raw))):
+                val = to_num(df_raw.iloc[r, potential_revenue_col])
+                if val > 0:
+                    sample_values.append(val)
+
+            if sample_values:
+                revenue_col = potential_revenue_col
+
+    return sku_col, revenue_col
+
+
+def process_ozon_report(df_raw):
+    """
+    Обрабатывает отчет Ozon в формате "Позаказный отчет о реализации"
+    """
+    # Ищем строку с заголовками (где есть "Артикул" и "SKU")
+    header_row = None
+
+    for r in range(min(len(df_raw), 100)):
+        for c in range(len(df_raw.columns) - 1):
+            val = str(df_raw.iloc[r, c]).strip().lower()
+            next_val = str(df_raw.iloc[r, c + 1]).strip().lower()
+
+            if val == "артикул" and next_val == "sku":
+                header_row = r
+                break
+        if header_row is not None:
+            break
+
+    if header_row is None:
+        return None
+
+    # Находим нужные колонки
+    sku_col, revenue_col = find_sku_and_revenue_columns(df_raw, header_row)
+
+    if sku_col is None:
+        return None
+
+    # Если не нашли колонку с выручкой, используем резервный метод
+    if revenue_col is None:
+        # Ищем любую колонку с числами после 10-й позиции от артикула
+        for c in range(sku_col + 8, len(df_raw.columns)):
+            sample_val = to_num(df_raw.iloc[header_row + 2, c])
+            if sample_val > 0:
+                revenue_col = c
                 break
 
-        # Если нашли Ozon формат
-        if found_row != -1:
-            # Берем заголовки из строки с "Артикул" и "SKU"
-            headers = []
-            for c in range(len(df_raw.columns)):
-                headers.append(str(df_raw.iloc[found_row, c]).strip().lower())
-
-            # Данные начинаются через 2 строки после заголовков
-            data_start = found_row + 2
-
-            # Берем все строки до первой пустой или итоговой строки
-            data_rows = []
-            for r in range(data_start, len(df_raw)):
-                row = df_raw.iloc[r]
-                # Проверяем, не пустая ли строка и не итоговая
-                first_cell = str(row.iloc[0]).strip() if len(row) > 0 else ''
-                if first_cell == '' or first_cell.lower() in ['итого', 'всего', 'nan']:
-                    # Проверяем, есть ли данные в других колонках
-                    if not any(str(row.iloc[c]).strip() not in ['', 'nan'] for c in range(1, min(5, len(row)))):
-                        break
-
-                data_rows.append(row)
-
-            if data_rows:
-                df_data = pd.DataFrame(data_rows)
-                df_data.columns = headers + ['unnamed_' + str(i) for i in range(len(headers), len(df_data.columns))]
-                return df_data
-            return None
-
-        # Если не нашли Ozon, ищем WB формат
-        for r in range(min(len(df_raw), 60)):
-            row_str = " ".join([str(x).lower() for x in df_raw.iloc[r] if pd.notna(x)])
-            if "артикул поставщика" in row_str or "к перечислению" in row_str:
-                headers = [str(x).strip().lower() for x in df_raw.iloc[r]]
-                data_rows = []
-                for r2 in range(r + 1, len(df_raw)):
-                    first_cell = str(df_raw.iloc[r2, 0]).strip() if len(df_raw.iloc[r2]) > 0 else ''
-                    if first_cell == '' or first_cell.lower() in ['итого', 'всего', 'nan']:
-                        break
-                    data_rows.append(df_raw.iloc[r2])
-
-                if data_rows:
-                    df_data = pd.DataFrame(data_rows)
-                    df_data.columns = headers + ['unnamed_' + str(i) for i in range(len(headers), len(df_data.columns))]
-                    return df_data
-                return None
-
+    if revenue_col is None:
         return None
 
-    except Exception as e:
-        st.error(f"Ошибка чтения {filename}: {e}")
-        return None
+    # Собираем данные
+    result_data = []
 
+    for r in range(header_row + 2, len(df_raw)):
+        sku = str(df_raw.iloc[r, sku_col]).strip()
 
-def process_report(df):
-    """Обрабатывает отчет, извлекая артикулы и выручку"""
-    if df is None or df.empty:
-        return None
-
-    costs = get_costs()
-    cols = list(df.columns)
-
-    # Детекция WB
-    is_wb = any("артикул поставщика" in str(c) or "обоснование" in str(c) for c in cols)
-
-    try:
-        if is_wb:
-            # Wildberries
-            sku_col = next((c for c in cols if "артикул поставщика" in str(c) or "артикул" == str(c)), None)
-            rev_col = next((c for c in cols if "к перечислению" in str(c) or "возмещение" in str(c)), None)
-            source = "Wildberries"
-        else:
-            # Ozon - ищем "артикул" и колонку с суммой к начислению
-            sku_col = next((c for c in cols if str(c) == "артикул"), None)
-
-            # Ищем колонку с итоговой суммой
-            rev_col = None
-            for c in cols:
-                col_name = str(c)
-                if any(term in col_name for term in ["итого к начислению", "начислено", "итого", "сумма"]):
-                    rev_col = c
+        # Пропускаем пустые строки и итоги
+        if sku.lower() in ['nan', '', 'итого', 'всего']:
+            # Проверяем, есть ли еще данные
+            has_more_data = False
+            for check_r in range(r + 1, min(r + 5, len(df_raw))):
+                check_sku = str(df_raw.iloc[check_r, sku_col]).strip()
+                if check_sku.lower() not in ['nan', '', 'итого', 'всего']:
+                    has_more_data = True
                     break
+            if not has_more_data:
+                break
+            continue
 
-            # Если не нашли по названию, ищем по содержанию (может быть колонка 13)
-            if rev_col is None:
-                # Проверяем, есть ли числовые значения в колонках
-                for c in cols:
-                    if 'unnamed' not in str(c) or '13' in str(c):
-                        sample_vals = df[c].head(3).apply(to_num)
-                        if sample_vals.sum() > 0:
-                            rev_col = c
-                            break
+        # Пропускаем слишком длинные числовые строки (например, штрих-коды)
+        if sku.isdigit() and len(sku) > 8:
+            continue
 
-            source = "Ozon"
+        # Получаем выручку
+        revenue = to_num(df_raw.iloc[r, revenue_col])
 
-        if sku_col is None:
-            return None
-
-        # Создаем датафрейм с результатами
-        result_data = []
-        for idx, row in df.iterrows():
-            sku = str(row[sku_col]).strip()
-
-            # Пропускаем пустые артикулы и итоговые строки
-            if sku.lower() in ['nan', '', 'итого', 'всего']:
-                continue
-
-            # Пропускаем строки, где артикул - это число без букв (скорее всего, это не артикул)
-            if sku.isdigit() and len(sku) > 4:
-                continue
-
-            # Получаем выручку
-            revenue = 0.0
-            if rev_col and rev_col in row.index:
-                revenue = to_num(row[rev_col])
-            elif rev_col and 'итого к начислению' in str(rev_col):
-                revenue = to_num(row[rev_col])
-
+        if revenue > 0:  # Добавляем только строки с положительной выручкой
             result_data.append({
                 'Артикул': sku,
                 'Выручка': revenue,
-                'Маркетплейс': source
+                'Маркетплейс': 'Ozon'
             })
 
-        if not result_data:
-            return None
-
-        res = pd.DataFrame(result_data)
-
-        # Группируем по артикулу и маркетплейсу
-        res = res.groupby(['Артикул', 'Маркетплейс'])['Выручка'].sum().reset_index()
-
-        # Добавляем себестоимость
-        res['Себестоимость'] = res['Артикул'].map(costs).fillna(0.0)
-
-        return res
-
-    except Exception as e:
-        st.error(f"Ошибка обработки: {e}")
+    if not result_data:
         return None
+
+    return pd.DataFrame(result_data)
+
+
+def process_compensation_report(df_raw):
+    """
+    Обрабатывает отчет о компенсациях Ozon
+    """
+    # Ищем строку с заголовками
+    header_row = None
+
+    for r in range(min(len(df_raw), 100)):
+        for c in range(len(df_raw.columns)):
+            val = str(df_raw.iloc[r, c]).strip().lower()
+            if val == "артикул":
+                # Проверяем, что рядом есть SKU или это компенсационный отчет
+                for c2 in range(len(df_raw.columns)):
+                    if "компенсац" in str(df_raw.iloc[max(0, r - 2), c2]).lower():
+                        header_row = r
+                        break
+                if header_row is None:
+                    header_row = r
+                break
+        if header_row is not None:
+            break
+
+    if header_row is None:
+        return None
+
+    # Находим колонки: артикул и итого к начислению
+    sku_col = None
+    revenue_col = None
+
+    for c in range(len(df_raw.columns)):
+        header = str(df_raw.iloc[header_row, c]).strip().lower()
+        if header == "артикул":
+            sku_col = c
+        elif "итого к начислению" in header:
+            revenue_col = c
+
+    if sku_col is None or revenue_col is None:
+        return None
+
+    # Собираем данные
+    result_data = []
+
+    for r in range(header_row + 1, len(df_raw)):
+        sku = str(df_raw.iloc[r, sku_col]).strip()
+
+        if sku.lower() in ['nan', '', 'итого', 'всего', 'всего к начислению:']:
+            break
+
+        revenue = to_num(df_raw.iloc[r, revenue_col])
+
+        if revenue > 0:
+            result_data.append({
+                'Артикул': sku,
+                'Выручка': revenue,
+                'Маркетплейс': 'Ozon'
+            })
+
+    if not result_data:
+        return None
+
+    return pd.DataFrame(result_data)
 
 
 def process_report_multiple_sheets(content, filename):
@@ -214,96 +238,47 @@ def process_report_multiple_sheets(content, filename):
         excel_file = pd.ExcelFile(io.BytesIO(content))
         all_data = []
 
+        # Приоритетные листы для обработки
+        priority_sheets = []
+        other_sheets = []
+
         for sheet_name in excel_file.sheet_names:
+            sheet_lower = sheet_name.lower()
+            # Пропускаем заведомо ненужные листы
+            skip_keywords = ['биллинг', 'взаиморасчет', 'перевыставлен', 'лояльност', 'штраф', 'механик']
+            if any(keyword in sheet_lower for keyword in skip_keywords):
+                continue
+
+            # Приоритетные листы с отчетами о реализации
+            if any(keyword in sheet_lower for keyword in ['реализац', 'компенсац']):
+                priority_sheets.append(sheet_name)
+            else:
+                other_sheets.append(sheet_name)
+
+        # Обрабатываем сначала приоритетные листы
+        for sheet_name in priority_sheets + other_sheets:
             df_raw = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, header=None, dtype=str)
-            df_processed = process_report_from_raw(df_raw, filename, sheet_name)
-            if df_processed is not None:
-                all_data.append(df_processed)
+
+            # Пробуем разные обработчики
+            result = process_ozon_report(df_raw)
+            if result is None:
+                result = process_compensation_report(df_raw)
+
+            if result is not None and not result.empty:
+                all_data.append(result)
 
         if all_data:
             return pd.concat(all_data, ignore_index=True)
         return None
     except Exception as e:
-        st.error(f"Ошибка обработки многостраничного файла {filename}: {e}")
+        st.error(f"Ошибка обработки файла {filename}: {e}")
         return None
-
-
-def process_report_from_raw(df_raw, filename, sheet_name=""):
-    """Обрабатывает сырой датафрейм"""
-    # Пропускаем известные нерелевантные листы
-    skip_keywords = ['биллинг', 'взаиморасчет', 'перевыставлен', 'лояльност', 'штраф']
-    if any(keyword in sheet_name.lower() for keyword in skip_keywords):
-        return None
-
-    # Ищем связку "Артикул + SKU"
-    found_row, found_col_sku = -1, -1
-
-    for r in range(min(len(df_raw), 100)):
-        for c in range(len(df_raw.columns) - 1):
-            val = str(df_raw.iloc[r, c]).strip().lower()
-            next_val = str(df_raw.iloc[r, c + 1]).strip().lower()
-
-            if val == "артикул" and next_val == "sku":
-                found_row = r
-                found_col_sku = c
-                break
-        if found_row != -1:
-            break
-
-    if found_row == -1:
-        return None
-
-    # Получаем заголовки
-    headers = []
-    for c in range(len(df_raw.columns)):
-        headers.append(str(df_raw.iloc[found_row, c]).strip().lower())
-
-    # Данные начинаются через 2 строки
-    data_start = found_row + 2
-
-    # Собираем данные
-    data_rows = []
-    for r in range(data_start, len(df_raw)):
-        row = df_raw.iloc[r]
-
-        # Проверяем, есть ли артикул в первой колонке
-        if found_col_sku < len(row):
-            sku = str(row.iloc[found_col_sku]).strip()
-
-            # Пропускаем пустые и итоговые строки
-            if sku in ['nan', '', 'итого', 'всего']:
-                # Проверяем, есть ли другие данные в строке
-                has_data = False
-                for c in range(len(row)):
-                    if c != found_col_sku:
-                        val = str(row.iloc[c]).strip()
-                        if val not in ['', 'nan']:
-                            has_data = True
-                            break
-                if not has_data:
-                    break
-                continue
-
-            data_rows.append(row)
-
-    if not data_rows:
-        return None
-
-    df = pd.DataFrame(data_rows)
-    if df.empty:
-        return None
-
-    # Назначаем заголовки
-    all_headers = headers + [f'col_{i}' for i in range(len(headers), len(df.columns))]
-    df.columns = all_headers[:len(df.columns)]
-
-    return process_report(df)
 
 
 # --- UI ---
 init_db()
 st.title("💎 Ecom Insight Pro v3.0")
-st.write("Специальный алгоритм: поиск по связке 'Артикул + SKU' и отступ 2 строки.")
+st.markdown("Специальный алгоритм: поиск по связке 'Артикул + SKU' и отступ 2 строки.")
 
 uploaded_files = st.file_uploader("Загрузите Excel или CSV", accept_multiple_files=True,
                                   type=['xlsx', 'xls', 'csv'])
@@ -314,28 +289,21 @@ if uploaded_files:
     with st.spinner('Обрабатываю файлы...'):
         for f in uploaded_files:
             content = f.read()
-
-            # Пробуем обработать как многостраничный Excel
-            if f.name.lower().endswith(('.xlsx', '.xls')):
-                result = process_report_multiple_sheets(content, f.name)
-                if result is not None and not result.empty:
-                    all_data.append(result)
-            else:
-                # Для CSV пробуем обычное чтение
-                df_raw = ultra_smart_read(content, f.name)
-                if df_raw is not None:
-                    processed = process_report(df_raw)
-                    if processed is not None and not processed.empty:
-                        all_data.append(processed)
+            result = process_report_multiple_sheets(content, f.name)
+            if result is not None and not result.empty:
+                all_data.append(result)
 
     if all_data:
         full_df = pd.concat(all_data, ignore_index=True)
 
         # Группируем по артикулу и маркетплейсу
         full_df = full_df.groupby(['Артикул', 'Маркетплейс']).agg({
-            'Выручка': 'sum',
-            'Себестоимость': 'sum'
+            'Выручка': 'sum'
         }).reset_index()
+
+        # Добавляем себестоимость
+        costs = get_costs()
+        full_df['Себестоимость'] = full_df['Артикул'].map(costs).fillna(0.0)
 
         # Проверка цен
         missing = full_df[full_df['Себестоимость'] == 0]['Артикул'].unique()
@@ -345,9 +313,9 @@ if uploaded_files:
                 with st.form("price_form"):
                     new_costs = {}
                     for sku in missing:
-                        c1, c2 = st.columns([3, 1])
-                        c1.write(f"**{sku}**")
-                        new_v = c2.number_input(f"Цена закупки", key=f"cost_{sku}", min_value=0.0, step=100.0)
+                        col1, col2 = st.columns([3, 1])
+                        col1.write(f"**{sku}**")
+                        new_v = col2.number_input(f"Цена закупки", key=f"cost_{sku}", min_value=0.0, step=100.0)
                         if new_v > 0:
                             new_costs[sku] = new_v
 
@@ -376,6 +344,7 @@ if uploaded_files:
         m2.metric("📈 Прибыль", f"{total_profit:,.0f} ₽")
         m3.metric("📊 ROI", f"{roi:.1f}%")
 
+        # Таблица с результатами
         st.dataframe(
             full_df.style.format({
                 'Выручка': '{:,.2f} ₽',
@@ -387,28 +356,28 @@ if uploaded_files:
             hide_index=True
         )
 
-        # Дополнительная аналитика
+        # Дополнительная информация
         with st.expander("📊 Детальная аналитика"):
             col1, col2 = st.columns(2)
             with col1:
-                st.subheader("По маркетплейсам")
-                mp_stats = full_df.groupby('Маркетплейс').agg({
-                    'Выручка': 'sum',
-                    'Прибыль': 'sum'
-                }).round(2)
-                st.dataframe(mp_stats, use_container_width=True)
-
-            with col2:
                 st.subheader("Топ-5 товаров по прибыли")
                 top_products = full_df.nlargest(5, 'Прибыль')[['Артикул', 'Прибыль']]
-                st.dataframe(top_products, use_container_width=True)
+                st.dataframe(top_products, use_container_width=True, hide_index=True)
+
+            with col2:
+                st.subheader("Товары с отрицательной прибылью")
+                negative_profit = full_df[full_df['Прибыль'] < 0][['Артикул', 'Прибыль']]
+                if not negative_profit.empty:
+                    st.dataframe(negative_profit, use_container_width=True, hide_index=True)
+                else:
+                    st.success("Все товары прибыльные!")
 
     else:
         st.error("❌ Не удалось найти данные в загруженных файлах.")
         st.info("""
         **Проверьте, что файлы содержат:**
         - Для Ozon: ячейки "Артикул" и "SKU" рядом в одной строке
-        - Для Wildberries: колонку "Артикул поставщика"
+        - Отчеты о реализации или компенсациях
 
         **Поддерживаемые форматы:** Excel (.xlsx, .xls), CSV
         """)
